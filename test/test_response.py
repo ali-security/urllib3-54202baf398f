@@ -483,6 +483,76 @@ class TestResponse(object):
         with pytest.raises(StopIteration):
             next(stream)
 
+    def test_read_with_illegal_mix_decode_toggle(self):
+        compress = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+        data = compress.compress(b"foo")
+        data += compress.flush()
+
+        fp = BytesIO(data)
+
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "deflate"}, preload_content=False
+        )
+
+        # There is no decoded-data buffer here, a read() returns whatever the
+        # decoder yields for the raw bytes consumed. All but the last byte of
+        # the stream decodes to b"foo" and leaves a byte for the read() below.
+        assert resp.read(len(data) - 1) == b"foo"
+
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                r"Calling read\(decode_content=False\) is not supported after "
+                r"read\(decode_content=True\) was called"
+            ),
+        ):
+            resp.read(1, decode_content=False)
+
+    def test_read_with_mix_decode_toggle(self):
+        compress = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+        data = compress.compress(b"foo")
+        data += compress.flush()
+
+        fp = BytesIO(data)
+
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "deflate"}, preload_content=False
+        )
+        resp.read(1, decode_content=False)
+        assert resp.read(len(data) - 1, decode_content=True) == b"oo"
+
+    @mock.patch("urllib3.response.GzipDecoder.decompress")
+    def test_drain_conn_does_not_decode_content(self, gzip_decompress):
+        # A gzip bomb: tiny on the wire, huge once decompressed. Draining the
+        # connection (as redirect handling does) must not decompress it.
+        compress = zlib.compressobj(9, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+        data = compress.compress(b"0" * 1024 * 1024)
+        data += compress.flush()
+
+        fp = BytesIO(data)
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "gzip"}, preload_content=False
+        )
+
+        resp.drain_conn()
+
+        assert not gzip_decompress.called
+
+    def test_drain_conn_decodes_content_once_decoding_started(self):
+        compress = zlib.compressobj(6, zlib.DEFLATED, -zlib.MAX_WBITS)
+        data = compress.compress(b"foobar")
+        data += compress.flush()
+
+        fp = BytesIO(data)
+        resp = HTTPResponse(
+            fp, headers={"content-encoding": "deflate"}, preload_content=False
+        )
+
+        assert resp.read(len(data) - 1) == b"foobar"
+        # Decoding already started, so draining keeps decoding instead of
+        # raising the illegal-mix RuntimeError.
+        resp.drain_conn()
+
     def test_gzipped_streaming(self):
         compress = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
         data = compress.compress(b"foo")
